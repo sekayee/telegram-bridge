@@ -129,8 +129,9 @@ def load_context(project_path: str | None) -> str:
     history = "".join(lines)
 
     project_line = f"当前项目: {project_path}\n" if project_path else "当前项目: unknown\n"
+    concise_hint = "【重要】回复要简短，像微信/短信一样，通常1-3句话，除非用户明确要求详细说明。\n"
 
-    return project_line + "最近对话:\n" + history
+    return concise_hint + project_line + "最近对话:\n" + history
 
 
 async def parse_stream(line: str, seen_ids: set):
@@ -185,9 +186,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     project_path = detect_project()
     context_prompt = load_context(project_path)
 
-    # Send placeholder that will be edited with the response
-    status_msg = await context.bot.send_message(chat_id=chat_id, text="🤔 thinking...")
-
     # Periodically refresh typing indicator in background (Telegram shows it for ~5s per call)
     async def keep_typing():
         for _ in range(40):  # up to 40 * 3 = 120s
@@ -222,7 +220,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await proc.stdin.close()
 
     buffer = ""
-    last_edit = 0
     seen_ids = set()
     timeout_secs = 120
 
@@ -257,13 +254,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chunk = await parse_stream(line.decode("utf-8", errors="replace").strip(), seen_ids)
             if chunk:
                 buffer += chunk
-                now = asyncio.get_event_loop().time()
-                if now - last_edit >= EDIT_DEBOUNCE and buffer:
-                    try:
-                        await status_msg.edit_text(buffer[:4096])
-                    except Exception:
-                        pass
-                    last_edit = now
 
         await proc.wait()
         stderr_task.cancel()
@@ -290,10 +280,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buffer = "⚠️ no response (check session or network)"
 
     final = buffer.strip()
-    try:
-        await status_msg.edit_text(final[:4096])
-    except Exception:
-        pass
+    if final:
+        await context.bot.send_message(chat_id=chat_id, text=final[:4096])
 
     duration_ms = (time.time() - start_time) * 1000
     log_message("telegram", user_text, final, [], [])
