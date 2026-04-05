@@ -185,7 +185,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     project_path = detect_project()
     context_prompt = load_context(project_path)
 
-    # Send placeholder
+    # Show typing action to indicate processing
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    # Send placeholder that will be edited with the response
     status_msg = await context.bot.send_message(chat_id=chat_id, text="🤔 thinking...")
 
     args = [
@@ -206,46 +209,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
     )
 
-    # Pass user text via stdin to avoid command-line injection risk
-    await proc.stdin.write(user_text.encode("utf-8"))
-    await proc.stdin.close()
+    # Pass user text via stdin to avoid command-line injection and batch file issues
+    try:
+        stdout_data, stderr_data = await asyncio.wait_for(
+            proc.communicate(input=user_text.encode("utf-8")),
+            timeout=120,
+        )
+    except asyncio.TimeoutError:
+        await proc.kill()
+        final = "⚠️ Claude timed out after 120 seconds"
+        try:
+            await status_msg.edit_text(final)
+        except Exception:
+            pass
+        duration_ms = (time.time() - start_time) * 1000
+        log_message("telegram", user_text, final, [], [])
+        return
 
     buffer = ""
-    last_edit = 0
     seen_ids = set()
-    timeout_secs = 120
-
-    try:
-        while True:
-            try:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout_secs)
-            except asyncio.TimeoutError:
-                await proc.kill()
-                buffer = "⚠️ Claude timed out after 120 seconds"
-                break
-
-            if not line:
-                break
-
-            chunk = await parse_stream(line.decode("utf-8", errors="replace").strip(), seen_ids)
-            if chunk:
-                buffer += chunk
-                now = asyncio.get_event_loop().time()
-                if now - last_edit >= EDIT_DEBOUNCE and buffer:
-                    try:
-                        await status_msg.edit_text(buffer[:4096])
-                    except Exception:
-                        pass
-                    last_edit = now
-
-        await proc.wait()
-    except asyncio.CancelledError:
-        await proc.kill()
-        buffer = "⚠️ Request cancelled"
+    for line in stdout_data.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        chunk = await parse_stream(line, seen_ids)
+        if chunk:
+            buffer += chunk
 
     if not buffer:
-        stderr_raw = await proc.stderr.read()
-        stderr_text = stderr_raw.decode("gbk", errors="replace").strip()
+        stderr_text = stderr_data.decode("gbk", errors="replace").strip()
         if stderr_text:
             buffer = f"⚠️ error:\n{stderr_text[:500]}"
         else:
@@ -255,7 +247,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await status_msg.edit_text(final[:4096])
     except Exception:
-        pass  # MessageNotModified or identical content — no need to resend
+        pass
 
     duration_ms = (time.time() - start_time) * 1000
     log_message("telegram", user_text, final, [], [])
