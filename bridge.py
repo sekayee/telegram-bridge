@@ -185,11 +185,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     project_path = detect_project()
     context_prompt = load_context(project_path)
 
-    # Show typing action to indicate processing
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
     # Send placeholder that will be edited with the response
     status_msg = await context.bot.send_message(chat_id=chat_id, text="🤔 thinking...")
+
+    # Periodically refresh typing indicator in background (Telegram shows it for ~5s per call)
+    async def keep_typing():
+        for _ in range(40):  # up to 40 * 3 = 120s
+            await asyncio.sleep(3)
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                break
+
+    typing_task = asyncio.create_task(keep_typing())
 
     args = [
         CLAUDE_BIN,
@@ -209,38 +217,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
     )
 
-    # Pass user text via stdin to avoid command-line injection and batch file issues
-    try:
-        stdout_data, stderr_data = await asyncio.wait_for(
-            proc.communicate(input=user_text.encode("utf-8")),
-            timeout=120,
-        )
-    except asyncio.TimeoutError:
-        await proc.kill()
-        final = "⚠️ Claude timed out after 120 seconds"
-        try:
-            await status_msg.edit_text(final)
-        except Exception:
-            pass
-        duration_ms = (time.time() - start_time) * 1000
-        log_message("telegram", user_text, final, [], [])
-        return
+    # Write stdin and close it so Claude stops reading input
+    await proc.stdin.write(user_text.encode("utf-8"))
+    await proc.stdin.close()
 
     buffer = ""
+    last_edit = 0
     seen_ids = set()
-    for line in stdout_data.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        chunk = await parse_stream(line, seen_ids)
-        if chunk:
-            buffer += chunk
+    timeout_secs = 120
+
+    # Read stderr in background to prevent buffer deadlock
+    stderr_data = []
+    async def drain_stderr():
+        while True:
+            try:
+                line = await asyncio.wait_for(proc.stderr.readline(), timeout=1)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            if not line:
+                break
+            stderr_data.append(line)
+
+    stderr_task = asyncio.create_task(drain_stderr())
+
+    try:
+        while True:
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout_secs)
+            except asyncio.TimeoutError:
+                await proc.kill()
+                buffer = "⚠️ Claude timed out after 120 seconds"
+                break
+
+            if not line:
+                break
+
+            chunk = await parse_stream(line.decode("utf-8", errors="replace").strip(), seen_ids)
+            if chunk:
+                buffer += chunk
+                now = asyncio.get_event_loop().time()
+                if now - last_edit >= EDIT_DEBOUNCE and buffer:
+                    try:
+                        await status_msg.edit_text(buffer[:4096])
+                    except Exception:
+                        pass
+                    last_edit = now
+
+        await proc.wait()
+        stderr_task.cancel()
+        try:
+            await stderr_task
+        except asyncio.CancelledError:
+            pass
+    except asyncio.CancelledError:
+        await proc.kill()
+        buffer = "⚠️ Request cancelled"
+
+    typing_task.cancel()
+    try:
+        await typing_task
+    except asyncio.CancelledError:
+        pass
 
     if not buffer:
-        stderr_text = stderr_data.decode("gbk", errors="replace").strip()
-        if stderr_text:
-            buffer = f"⚠️ error:\n{stderr_text[:500]}"
-        else:
+        if stderr_data:
+            stderr_text = b"".join(stderr_data).decode("gbk", errors="replace").strip()
+            if stderr_text:
+                buffer = f"⚠️ error:\n{stderr_text[:500]}"
+        if not buffer:
             buffer = "⚠️ no response (check session or network)"
 
     final = buffer.strip()
