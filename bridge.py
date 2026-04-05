@@ -197,14 +197,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     if context_prompt:
         args.extend(["--append-system-prompt", context_prompt])
-    args.append(user_text)
 
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
     )
+
+    # Pass user text via stdin to avoid command-line injection risk
+    await proc.stdin.write(user_text.encode("utf-8"))
+    await proc.stdin.close()
 
     buffer = ""
     last_edit = 0
@@ -235,9 +239,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     last_edit = now
 
         await proc.wait()
-    except asyncio.TimeoutError:
+    except asyncio.CancelledError:
         await proc.kill()
-        buffer = "⚠️ Claude timed out"
+        buffer = "⚠️ Request cancelled"
 
     if not buffer:
         stderr_raw = await proc.stderr.read()
