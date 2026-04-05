@@ -197,6 +197,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     typing_task = asyncio.create_task(keep_typing())
 
+    # Periodically refresh typing indicator in background (Telegram shows it for ~5s per call)
+    async def keep_typing():
+        for _ in range(40):  # up to 40 * 3 = 120s
+            await asyncio.sleep(3)
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                break
+
+    typing_task = asyncio.create_task(keep_typing())
+
     args = [
         CLAUDE_BIN,
         CLAUDE_CLI,
@@ -216,8 +227,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Write stdin and close it so Claude stops reading input
-    await proc.stdin.write(user_text.encode("utf-8"))
-    await proc.stdin.close()
+    proc.stdin.write(user_text.encode("utf-8"))
+    proc.stdin.close()
 
     buffer = ""
     seen_ids = set()
@@ -272,6 +283,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     if not buffer:
+        # Check collected stderr data
         if stderr_data:
             stderr_text = b"".join(stderr_data).decode("gbk", errors="replace").strip()
             if stderr_text:
