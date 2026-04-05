@@ -1,0 +1,6 @@
+.env
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+bridge_startup.log
