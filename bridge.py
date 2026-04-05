@@ -14,7 +14,8 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Use native Windows batch script — avoids bash path issues in Python subprocess
-CLAUDE_BIN = "C:/nvm4w/nodejs/claude.cmd"
+CLAUDE_BIN = "C:/nvm4w/nodejs/node.exe"
+CLAUDE_CLI = "C:/nvm4w/nodejs/node_modules/@anthropic-ai/claude-code/cli.js"
 EDIT_DEBOUNCE = 0.5
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.log")
 MESSAGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "messages.json")
@@ -189,36 +190,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = [
         CLAUDE_BIN,
+        CLAUDE_CLI,
         "--print",
         "--output-format", "stream-json",
         "--verbose",
     ]
     if context_prompt:
         args.extend(["--append-system-prompt", context_prompt])
+    args.append(user_text)
 
     proc = await asyncio.create_subprocess_exec(
         *args,
-        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
     )
 
-    # Write prompt via stdin (avoids Windows batch file arg-passing issues)
-    stdout_data, stderr_data = await proc.communicate(input=user_text.encode("utf-8"))
-
     buffer = ""
+    last_edit = 0
     seen_ids = set()
-    for line in stdout_data.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        chunk = await parse_stream(line, seen_ids)
-        if chunk:
-            buffer += chunk
+    timeout_secs = 120
+
+    try:
+        while True:
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout_secs)
+            except asyncio.TimeoutError:
+                await proc.kill()
+                buffer = "⚠️ Claude timed out after 120 seconds"
+                break
+
+            if not line:
+                break
+
+            chunk = await parse_stream(line.decode("utf-8", errors="replace").strip(), seen_ids)
+            if chunk:
+                buffer += chunk
+                now = asyncio.get_event_loop().time()
+                if now - last_edit >= EDIT_DEBOUNCE and buffer:
+                    try:
+                        await status_msg.edit_text(buffer[:4096])
+                    except Exception:
+                        pass
+                    last_edit = now
+
+        await proc.wait()
+    except asyncio.TimeoutError:
+        await proc.kill()
+        buffer = "⚠️ Claude timed out"
 
     if not buffer:
-        stderr_text = stderr_data.decode("gbk", errors="replace").strip()
+        stderr_raw = await proc.stderr.read()
+        stderr_text = stderr_raw.decode("gbk", errors="replace").strip()
         if stderr_text:
             buffer = f"⚠️ error:\n{stderr_text[:500]}"
         else:
