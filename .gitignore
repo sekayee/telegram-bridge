@@ -4,4 +4,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 bridge_startup.log
+.bridge_stdout.log
 .worktrees/
+.remember/
+.claude/
+messages.json
+sessions.json
+err.txt
+out.txt
+2026-04-*.txt
+terminal-hook*.txt
