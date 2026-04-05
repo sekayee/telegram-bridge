@@ -3,7 +3,6 @@ import json
 import asyncio
 import subprocess
 import time
-import shlex
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -183,7 +182,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[DEBUG] Received message from {chat_id}: {user_text[:50]}")
 
     project_path = detect_project()
-    context_prompt = ""  # load_context(project_path)  # TEMP: disabled for test
+    context_prompt = load_context(project_path)
 
     # Send placeholder
     status_msg = await context.bot.send_message(chat_id=chat_id, text="🤔 thinking...")
@@ -196,37 +195,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     if context_prompt:
         args.extend(["--append-system-prompt", context_prompt])
-    args.append(user_text)
-    cmd_str = " ".join(shlex.quote(a) for a in args)
 
-    proc = await asyncio.create_subprocess_shell(
-        cmd_str,
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
     )
 
-    buffer = ""
-    last_edit = 0
-    seen_ids = set()
+    # Write prompt via stdin (avoids Windows batch file arg-passing issues)
+    stdout_data, stderr_data = await proc.communicate(input=user_text.encode("utf-8"))
 
-    async for line in proc.stdout:
-        chunk = await parse_stream(line.decode("utf-8", errors="replace").strip(), seen_ids)
+    buffer = ""
+    seen_ids = set()
+    for line in stdout_data.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        chunk = await parse_stream(line, seen_ids)
         if chunk:
             buffer += chunk
-            now = asyncio.get_event_loop().time()
-            if now - last_edit >= EDIT_DEBOUNCE and buffer:
-                try:
-                    await status_msg.edit_text(buffer[:4096])
-                except Exception:
-                    pass
-                last_edit = now
-
-    await proc.wait()
 
     if not buffer:
-        stderr_raw = await proc.stderr.read()
-        stderr_text = stderr_raw.decode("gbk", errors="replace").strip()
+        stderr_text = stderr_data.decode("gbk", errors="replace").strip()
         if stderr_text:
             buffer = f"⚠️ error:\n{stderr_text[:500]}"
         else:
