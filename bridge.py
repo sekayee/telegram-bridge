@@ -20,7 +20,11 @@ EDIT_DEBOUNCE = 0.5
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.log")
 MESSAGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "messages.json")
 SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
-AUTO_CONFIRM_FILES = True  # TODO: per-chat setting, for now True (skip confirmations)
+AUTO_CONFIRM_FILES = True  # False = ask user via Telegram, True = auto-confirm
+
+# Pending file edit confirmations: {chat_id: {"filepath": str, "event": asyncio.Event, "timestamp": float}}
+pending_confirms: dict[int, dict] = {}
+CONFIRM_TIMEOUT = 60  # seconds before confirmation expires
 
 
 def load_sessions() -> dict:
@@ -183,19 +187,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     print(f"[DEBUG] Received message from {chat_id}: {user_text[:50]}")
 
+    # Check if this message is a reply to a pending file edit confirmation
+    if chat_id in pending_confirms:
+        confirm_result = check_confirmation_reply(chat_id, user_text)
+        if confirm_result is not None:
+            # User replied to a confirmation - resolve it
+            pending_confirms[chat_id]["result"] = confirm_result
+            pending_confirms[chat_id]["event"].set()
+            # Send acknowledgment
+            ack = "✅ 已确认" if confirm_result else "❌ 已取消"
+            await context.bot.send_message(chat_id=chat_id, text=f"{ack}文件操作已{'批准' if confirm_result else '取消'}。")
+            return  # Don't process as a new message
+
+    # Clean up expired pending confirmations
+    now = time.time()
+    for cid in list(pending_confirms.keys()):
+        if now - pending_confirms[cid]["timestamp"] > CONFIRM_TIMEOUT:
+            pending_confirms.pop(cid, None)
+
     project_path = detect_project()
     context_prompt = load_context(project_path)
-
-    # Periodically refresh typing indicator in background (Telegram shows it for ~5s per call)
-    async def keep_typing():
-        for _ in range(40):  # up to 40 * 3 = 120s
-            await asyncio.sleep(3)
-            try:
-                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            except Exception:
-                break
-
-    typing_task = asyncio.create_task(keep_typing())
 
     # Periodically refresh typing indicator in background (Telegram shows it for ~5s per call)
     async def keep_typing():
@@ -214,6 +225,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "--print",
         "--output-format", "stream-json",
         "--verbose",
+        "--dangerously-skip-permissions",
     ]
     if context_prompt:
         args.extend(["--append-system-prompt", context_prompt])
@@ -325,20 +337,53 @@ def send_startup_notification_sync():
 async def confirm_file_edit(context: ContextTypes.DEFAULT_TYPE, chat_id: int, filepath: str) -> bool:
     """Ask user via Telegram if a file edit should proceed. Returns True if confirmed.
 
-    Sends confirmation message and waits for user reply.
-    Implementation: Simplified MVP - for now returns True immediately.
-    Full implementation would poll for user response.
+    Sends confirmation message and waits for user reply (是/否 or yes/no).
+    Times out after CONFIRM_TIMEOUT seconds (auto-rejects).
     """
+    # Auto-confirm if enabled
+    if AUTO_CONFIRM_FILES:
+        return True
+
+    # Check if there's already a pending confirmation for this chat_id
+    if chat_id in pending_confirms:
+        # Already pending, don't stack confirmations - auto-reject
+        return False
+
+    event = asyncio.Event()
+    pending_confirms[chat_id] = {
+        "filepath": filepath,
+        "event": event,
+        "timestamp": time.time(),
+    }
+
     try:
-        reply_msg = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id,
             text=f"要修改文件 {filepath} 吗？(回复 是 或 否)"
         )
-        # Simplified: Auto-confirm for now. Full implementation would track
-        # this message ID and wait for user reply in next message.
-        return True
+        # Wait for user response (with timeout)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=CONFIRM_TIMEOUT)
+            # User responded - check result
+            result = pending_confirms.get(chat_id, {}).get("result", False)
+            return result
+        except asyncio.TimeoutError:
+            return False
     except Exception:
         return False
+    finally:
+        # Clean up pending confirmation
+        pending_confirms.pop(chat_id, None)
+
+
+def check_confirmation_reply(chat_id: int, text: str) -> bool | None:
+    """Check if message text is a confirmation reply. Returns True/False or None if not a confirmation."""
+    text_lower = text.lower().strip()
+    if text_lower in ("是", "yes", "y", "确认", "ok", "好"):
+        return True
+    if text_lower in ("否", "no", "n", "不", "不要", "cancel"):
+        return False
+    return None
 
 
 def main():
